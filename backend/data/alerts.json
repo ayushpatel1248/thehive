@@ -1,0 +1,40 @@
+[
+  {
+    "id": "A-001",
+    "title": "Suspicious Cross-Port Process Activity",
+    "severity": "High",
+    "status": "New",
+    "timestamp": "2026-03-21T10:05:00Z",
+    "tags": ["network", "suspicious", "lateral-movement"],
+    "observables": [
+      {"type": "ip", "value": "192.168.1.55"},
+      {"type": "port", "value": "4444"}
+    ],
+    "description": "A process has initiated multiple connections across non-standard ports."
+  },
+  {
+    "id": "A-002",
+    "title": "Account Created and Deleted within 24 hours",
+    "severity": "Medium",
+    "status": "In Progress",
+    "timestamp": "2026-03-21T11:20:00Z",
+    "tags": ["iam", "audit", "account-lifecycle"],
+    "observables": [
+      {"type": "user", "value": "temp_admin_01"}
+    ],
+    "description": "User account was provisioned and subsequently deprovisioned in under 24 hours, suggesting potential unauthorized backdoor access or testing."
+  },
+  {
+    "id": "A-003",
+    "title": "DNS over HTTPS tunneling",
+    "severity": "Critical",
+    "status": "New",
+    "timestamp": "2026-03-21T08:15:00Z",
+    "tags": ["exfiltration", "dns", "evasion"],
+    "observables": [
+      {"type": "domain", "value": "evildoh.com"},
+      {"type": "ip", "value": "104.21.35.150"}
+    ],
+    "description": "An endpoint is bypassing standard DNS controls by using DoH to resolve uncommon domains, potentially indicating C2 communication or data exfiltration."
+  }
+]

@@ -1,0 +1,23 @@
+{
+  "Suspicious Cross-Port Process Activity": [
+    "Verify process instance using endpoint tool (Tanium)",
+    "Check command-line arguments of the process",
+    "Analyze parent process",
+    "Review network connections for unusual ports",
+    "Check if process is legitimate or malicious"
+  ],
+  "Account Created and Deleted within 24 hours": [
+    "Verify if account creation was authorized",
+    "Check user activity logs",
+    "Identify who created and deleted the account",
+    "Check for privilege escalation attempts",
+    "Contact the user or admin for confirmation"
+  ],
+  "DNS over HTTPS tunneling": [
+    "Analyze proxy logs for /dns-query patterns",
+    "Check URL reputation",
+    "Identify unusual DNS traffic behavior",
+    "Verify browser or system configuration",
+    "Check for data exfiltration attempts"
+  ]
+}
