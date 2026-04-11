@@ -1,0 +1,346 @@
+# --------------------------------------------------
+# 1 Configuration
+# --------------------------------------------------
+$subjectPrefix = "PCSIRT Weekly report"     # subject must start with this text
+$dateRangeStart = (Get-Date).AddDays(-7)    # start of date range (e.g., last 7 days)
+$dateRangeEnd = Get-Date                    # end of date range (e.g., today)
+$tempFolder = Join-Path -Path $env:TEMP -ChildPath ("PCSIRT_" + [guid]::NewGuid().ToString())
+# Better way to map the Desktop cross-platform or different Windows locales
+$desktopPath = [Environment]::GetFolderPath("Desktop")
+$wordFilePath = Join-Path -Path $desktopPath -ChildPath "PCSIRT_Report.docx"
+$emergencyPatchingSubjectPrefix = "[TLP:AMBER+STRICT][EMERGENCY][VULNERABILITY][ACTION REQUEST]"
+
+# --------------------------------------------------
+# 2 Prepare temporary folder
+# --------------------------------------------------
+New-Item -ItemType Directory -Path $tempFolder -Force | Out-Null
+
+# --------------------------------------------------
+# 3 Connect to Outlook and locate the e-mail
+# --------------------------------------------------
+Write-Host "Connecting to Outlook..."
+$ol = New-Object -ComObject Outlook.Application
+$ns = $ol.GetNamespace('MAPI')
+
+# Get the Inbox folder
+$inbox = $ns.GetDefaultFolder([Microsoft.Office.Interop.Outlook.OlDefaultFolders]::olFolderInbox)
+
+# Find the newest mail that matches the subject prefix and date range
+$mail = $inbox.Items |
+Where-Object {
+    $_ -is [Microsoft.Office.Interop.Outlook.MailItem] -and
+    $_.Subject -like "$subjectPrefix*" -and
+    $_.ReceivedTime -ge $dateRangeStart -and
+    $_.ReceivedTime -le $dateRangeEnd
+} |
+Sort-Object ReceivedTime -Descending |
+Select-Object -First 1
+
+if (-not $mail) {
+    Write-Error "No email found with subject starting with '$subjectPrefix' in the date range '$dateRangeStart' to '$dateRangeEnd'."
+    exit 1
+}
+
+Write-Host "Found email (Received: $($mail.ReceivedTime)). Saving attachments..."
+
+# --------------------------------------------------
+# 4 Save the two expected attachments
+# --------------------------------------------------
+$attachmentMap = @{
+    DailyChart  = 'daily_chart*.png'   # e.g. daily_chart_20251218_0831.png
+    WeeklyChart = 'weekly_chart*.png'  # e.g. weekly_chart_20251218_0831.png
+}
+
+foreach ($key in $attachmentMap.Keys) {
+    $pattern = $attachmentMap[$key]
+    $found = $false
+
+    foreach ($att in $mail.Attachments) {
+        if ($att.FileName -like $pattern) {
+            $targetPath = Join-Path $tempFolder $att.FileName
+            $att.SaveAsFile($targetPath)
+
+            # Copy the image file to the desktop
+            $desktopPath = Join-Path -Path $env:USERPROFILE -ChildPath 'Desktop'
+            $imagePath = Join-Path -Path $desktopPath -ChildPath $att.FileName
+            Copy-Item -Path $targetPath -Destination $imagePath
+
+            # expose as $DailyChartPath, $WeeklyChartPath, … for later use
+            Set-Variable -Name "${key}Path" -Value $imagePath -Scope Script
+            Write-Host "Saved $($att.FileName) -> $imagePath"
+
+            $found = $true
+        }
+    }
+
+    if (-not $found) {
+        Write-Warning "Attachment matching pattern '$pattern' was not found."
+    }
+}
+
+# --------------------------------------------------
+# Find the emergency patching emails
+# --------------------------------------------------
+$emergencyPatchingEmails = $inbox.Items |
+Where-Object {
+    $_ -is [Microsoft.Office.Interop.Outlook.MailItem] -and
+    $_.Subject -like "[TLP:AMBER+STRICT][EMERGENCY][VULNERABILITY][ACTION REQUEST]*" -and
+    $_.SenderEmailAddress -eq "ayush.1.patel@asia.bnpparibas.com" -and
+    $_.ReceivedTime -ge $dateRangeStart -and
+    $_.ReceivedTime -le $dateRangeEnd
+}
+
+$emergencyPatchingSubjects = @()
+
+foreach ($email in $emergencyPatchingEmails) {
+    $subject = $email.Subject
+    # Use literal .Replace() instead of regex -replace to avoid special character crashes
+    $subject = $subject.Replace("[TLP:AMBER+STRICT][EMERGENCY][VULNERABILITY][ACTION REQUEST]", "")
+    $subject = $subject.Trim()
+    $emergencyPatchingSubjects += $subject
+}
+
+# --------------------------------------------------
+# API call
+# --------------------------------------------------
+$url = ''
+$headers = @{
+    'Content-Type'  = 'application/json'
+    'Authorization' = 'Bearer '
+}
+
+$body = @{
+    query         = @(
+        @{
+            _name = "listCase"
+        },
+        @{
+            _name    = "filter"
+            _between = @{
+                _field = "_createdAt"
+                _from  = @{
+                    amount   = 7
+                    unit     = "days"
+                    look     = "behind"
+                    modifier = "startOfDay"
+                }
+                _to    = @{
+                    amount   = 0
+                    unit     = "days"
+                    look     = "behind"
+                    modifier = "endOfDay"
+                }
+            }
+        },
+        @{
+            _name   = "sort"
+            _fields = @(
+                @{
+                    _createdAt = "desc"
+                }
+            )
+        }
+    )
+
+    excludeFields = @(
+        "_updatedBy",
+        "_updatedAt",
+        "number",
+        "startDate",
+        "tags",
+        "flag",
+        "tlp",
+        "tlpLabel",
+        "pap",
+        "papLabel",
+        "stage",
+        "access",
+        "customFields",
+        "userPermissions",
+        "extraData",
+        "newDate",
+        "timeToDetect",
+        "description",
+        "summary"
+    )
+} | ConvertTo-Json -Depth 10
+
+$response = Invoke-WebRequest -Uri $url -Method Post -Headers $headers -Body $body -UseBasicParsing
+
+# Write-Host $response
+
+# Parse the response
+$data = $response.Content | ConvertFrom-Json
+
+# --------------------------------------------------
+# Initialize variables
+# --------------------------------------------------
+$totalClosed = 0
+$totalInProgress = 0
+$totalCritical = 0
+$totalMedium = 0
+$totalLow = 0
+$totalAlerts = 0
+$totalNew = 0
+$assigneeData = @{}
+
+# --------------------------------------------------
+# Loop through the data
+# --------------------------------------------------
+foreach ($item in $data) {
+    $totalAlerts++
+
+    # Check the status
+    if ($item.status -eq 'Closed') {
+        $totalClosed++
+    }
+    elseif ($item.status -eq 'InProgress') {
+        $totalInProgress++
+
+        # Get the assignee
+        $assignee = $item.assignee
+
+        # Update the assignee data
+        if ($assigneeData.ContainsKey($assignee)) {
+            $assigneeData[$assignee]++
+        }
+        else {
+            $assigneeData[$assignee] = 1
+        }
+    }
+    elseif ($item.status -eq 'New') {
+        $totalNew++
+    }
+
+    # Check the severity
+    if ($item.severityLabel -eq 'CRITICAL') {
+        $totalCritical++
+    }
+    elseif ($item.severityLabel -eq 'MEDIUM') {
+        $totalMedium++
+    }
+    elseif ($item.severityLabel -eq 'LOW') {
+        $totalLow++
+    }
+}
+
+# --------------------------------------------------
+# 5 Launch Word (visible = $true for debugging)
+# --------------------------------------------------
+Write-Host "Launching Word..."
+$word = New-Object -ComObject Word.Application
+$word.Visible = $true
+$wdAlertsNone = 0
+$word.DisplayAlerts = $wdAlertsNone
+$doc = $word.Documents.Add()
+
+# --------------------------------------------------
+# Helper functions
+# --------------------------------------------------
+function Add-Heading {
+    param(
+        [string]$Text,
+        [int] $Level = 1
+    )
+
+    $range = $doc.Content
+    $range.Collapse([Microsoft.Office.Interop.Word.WdCollapseDirection]::wdCollapseEnd)
+    $para = $doc.Paragraphs.Add($range)
+    $para.Range.Text = $Text
+    $para.Range.Style = "Heading $Level"
+    $para.Range.InsertParagraphAfter()
+    Write-Host " -> Added heading: $Text"
+}
+
+function Add-Image {
+    param(
+        [string]$path,
+        [float] $maxWidthInches = 6.5
+    )
+
+    if (-not (Test-Path $path)) {
+        Write-Warning "Could not find image to insert at: $path"
+        return
+    }
+
+    $range = $doc.Content
+    $range.Collapse([Microsoft.Office.Interop.Word.WdCollapseDirection]::wdCollapseEnd)
+
+    # $false = do not link to file, $true = save image inside the document
+    $inlineShape = $doc.InlineShapes.AddPicture($path, $false, $true)
+    
+    # Properly utilize your $maxWidthInches logic!
+    $inlineShape.LockAspectRatio = -1 # msoTrue
+    
+    $maxWidthPoints = $maxWidthInches * 72
+    if ($inlineShape.Width -gt $maxWidthPoints) {
+        $inlineShape.Width = $maxWidthPoints
+    }
+}
+
+Add-Heading -Text "Total Alerts: $totalAlerts" -Level 2
+Add-Heading -Text "Total New Alerts: $totalNew" -Level 2
+Add-Heading -Text "Total Closed: $totalClosed" -Level 2
+Add-Heading -Text "Total In Progress: $totalInProgress" -Level 2
+Add-Heading -Text "Assignee Data:" -Level 2
+
+foreach ($assignee in $assigneeData.Keys) {
+    Add-Heading -Text "$($assignee): $($assigneeData[$assignee])" -Level 3
+}
+
+Add-Heading -Text "Total Critical: $totalCritical" -Level 2
+Add-Heading -Text "Total Medium: $totalMedium" -Level 2
+Add-Heading -Text "Total Low: $totalLow" -Level 2
+
+# Output the Emergency Patching Action Requests (these were calculated but missing from the report!)
+if ($emergencyPatchingSubjects.Count -gt 0) {
+    Add-Heading -Text "Emergency Patching Action Requests:" -Level 2
+    foreach ($subj in $emergencyPatchingSubjects) {
+        Add-Heading -Text "- $subj" -Level 3
+    }
+}
+
+# Call Add-Image with the variables we saved earlier
+if ($WeeklyChartPath -and (Test-Path $WeeklyChartPath)) {
+    Add-Heading -Text "Weekly Chart:" -Level 2
+    Add-Image -path $WeeklyChartPath
+}
+
+if ($DailyChartPath -and (Test-Path $DailyChartPath)) {
+    Add-Heading -Text "Daily Chart:" -Level 2
+    Add-Image -path $DailyChartPath
+}
+
+# Just a blank paragraph – gives you space to type manually later
+$range = $doc.Content
+$range.Collapse([Microsoft.Office.Interop.Word.WdCollapseDirection]::wdCollapseEnd)
+$range.InsertParagraphAfter()
+
+# --------------------------------------------------
+# 7 Save the Word file and clean up
+# --------------------------------------------------
+$doc.SaveAs($wordFilePath, [Microsoft.Office.Interop.Word.WdSaveFormat]::wdFormatDocumentDefault)
+Start-Sleep -Milliseconds 1000
+Write-Host "Report generated: $wordFilePath"
+
+# Close and release COM objects
+# We are commenting out the code that closes Word so the document STAYS OPEN!
+# You mentioned you want to "type manually later".
+# 
+# $doc.Close()
+# $word.Quit()
+# 
+# [void][System.Runtime.Interopservices.Marshal]::ReleaseComObject($doc)
+# [void][System.Runtime.Interopservices.Marshal]::ReleaseComObject($word)
+# [void][System.Runtime.Interopservices.Marshal]::ReleaseComObject($ns)
+# [void][System.Runtime.Interopservices.Marshal]::ReleaseComObject($ol)
+# 
+# [GC]::Collect()
+# [GC]::WaitForPendingFinalizers()
+
+# --------------------------------------------------
+# Optional clean-up
+# --------------------------------------------------
+# Remove-Item -Path $tempFolder -Recurse -Force
+
+Write-Host "`nDone."
